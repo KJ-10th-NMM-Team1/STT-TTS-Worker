@@ -8,22 +8,38 @@ SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 ARCHIVE_ROOT=$( dirname "$SCRIPT_DIR" )
 # ---
 sudo apt-get update -y
-sudo apt-get install -y python3.12-venv jq
+if sudo apt-get install -y python3.11 python3.11-venv jq; then
+    PYTHON_BIN=$(command -v python3.11)
+    if [ -z "$PYTHON_BIN" ]; then
+        echo "ERROR: python3.11 installed but binary not found."
+        exit 1
+    fi
+    echo "Using Python interpreter: $PYTHON_BIN"
+else
+    echo "WARNING: python3.11 packages unavailable. Falling back to system python3."
+    sudo apt-get install -y python3 python3-venv jq
+    PYTHON_BIN=$(command -v python3)
+    if [ -z "$PYTHON_BIN" ]; then
+        echo "ERROR: python3 interpreter not found."
+        exit 1
+    fi
+    echo "Using Python interpreter: $PYTHON_BIN"
+fi
 
 # 3. venv가 설치될 최종 목적지
 APP_DIR="/home/ubuntu/app"
 VENV_DIR="$APP_DIR/venv"
 
 # 4. venv 생성
-if [ -d "$APP_DIR" ]; then
-    echo "Removing existing APP directory: $APP_DIR"
+if [ -d "$VENV_DIR" ]; then
+    echo "Removing existing venv: $VENV_DIR"
     rm -rf "$VENV_DIR"
 fi
 echo "Create APP directory: $APP_DIR"
-mkdir -p $APP_DIR
+mkdir -p "$APP_DIR"
 
 echo "Create APP venv: $VENV_DIR..."
-python3.11 -m venv "$VENV_DIR"
+"$PYTHON_BIN" -m venv "$VENV_DIR"
 
 echo "Activating virtual environment..."
 source "$VENV_DIR/bin/activate"
