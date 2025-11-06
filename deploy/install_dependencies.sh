@@ -8,7 +8,7 @@ SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 ARCHIVE_ROOT=$( dirname "$SCRIPT_DIR" )
 # ---
 sudo apt-get update -y
-sudo apt-get install -y python3.12-venv jq
+sudo apt-get install -y python3.11-venv jq
 
 # 3. venv가 설치될 최종 목적지
 APP_DIR="/home/ubuntu/app"
@@ -23,7 +23,7 @@ echo "Create APP directory: $APP_DIR"
 mkdir -p $APP_DIR
 
 echo "Create APP venv: $VENV_DIR..."
-python3.12 -m venv "$VENV_DIR"
+python3.11 -m venv "$VENV_DIR"
 
 echo "Activating virtual environment..."
 source "$VENV_DIR/bin/activate"
