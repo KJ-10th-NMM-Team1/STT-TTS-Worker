@@ -23,7 +23,7 @@ mkdir -p "$LOG_DIR"
 WORKER_LOG="$LOG_DIR/worker.log"
 WORKER_ERR_LOG="$LOG_DIR/worker_error.log"
 
-touch "$WORKER_LOG" "$WORKER_ERR_LOG"
+sudo touch "$WORKER_LOG" "$WORKER_ERR_LOG"
 
 echo "Starting worker process: python app/worker.py"
 nohup python -u app/worker.py > "$WORKER_LOG" 2> "$WORKER_ERR_LOG" &
