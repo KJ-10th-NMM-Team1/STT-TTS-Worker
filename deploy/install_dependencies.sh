@@ -36,7 +36,7 @@ if [ -d "$VENV_DIR" ]; then
     rm -rf "$VENV_DIR"
 fi
 echo "Create APP directory: $APP_DIR"
-mkdir -p "$APP_DIR"
+sudo mkdir -p "$APP_DIR"
 
 echo "Create APP venv: $VENV_DIR..."
 "$PYTHON_BIN" -m venv "$VENV_DIR"
