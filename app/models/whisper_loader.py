@@ -6,7 +6,7 @@ import boto3
 from botocore.exceptions import ClientError
 from faster_whisper import WhisperModel
 
-LOCAL_BASE = Path(os.getenv("WHISPER_LOCAL_DIR", "/app/models/whisper"))
+LOCAL_BASE = Path(os.getenv("WHISPER_LOCAL_DIR", "data/cache"))
 S3_BUCKET = os.getenv("WHISPER_S3_BUCKET")
 S3_PREFIX = os.getenv("WHISPER_S3_PREFIX", "whisper")
 MODEL_NAME = os.getenv("WHISPER_MODEL", "small")

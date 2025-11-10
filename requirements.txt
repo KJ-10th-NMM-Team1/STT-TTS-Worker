@@ -4,7 +4,7 @@ python-multipart==0.0.9
 faster-whisper==1.0.3
 whisperx==3.1.1
 pyannote.audio==3.1.1
-onnxruntime-gpu==1.19.0
+# onnxruntime-gpu==1.19.0
 demucs
 # Translation stack (supports tc-big ko->en and alt models via env)
 transformers==4.44.2
@@ -20,3 +20,6 @@ torchcodec
 # Worker dependencies
 boto3==1.34.160
 requests==2.32.3
+# 추가
+sudachipy==0.6.8
+onnxruntime==1.19.0

@@ -11,9 +11,9 @@ services:
       - .env
     environment:
       SEPARATE_BGM: "1"
-      USE_GPU: "1"
-      TTS_DEVICE: "cuda"
-      MT_DEVICE: "cuda"
+      USE_GPU: "0"
+      TTS_DEVICE: "cpu"
+      MT_DEVICE: "cpu"
       MT_FAST_ONLY: "1"
       MT_NUM_BEAMS: "1"
       MT_MAX_NEW_TOKENS: "96"
@@ -31,8 +31,8 @@ services:
       - ./cache/demucs:/app/cache/demucs
       - ~/.aws:/root/.aws:ro
     shm_size: "2gb"
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - capabilities: ["gpu"]
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - capabilities: ["gpu"]

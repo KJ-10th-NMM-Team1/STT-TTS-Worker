@@ -34,7 +34,7 @@ from .vad import (
     complement_intervals,
     merge_intervals,
 )
-
+from .models.whisper_loader import get_model
 from typing import Tuple
 
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "small")  # base|small|medium|large-v3
@@ -99,7 +99,8 @@ def _pick_ref(audio_wav_16k: str, out_ref_24k: str):
 
 
 def _whisper_transcribe(audio_wav_16k: str):
-    model = WhisperModel(WHISPER_MODEL, device=_device, compute_type=_compute)
+    # model = WhisperModel(WHISPER_MODEL, device=_device, compute_type=_compute)
+    model = get_model()
     segments, info = model.transcribe(
         audio_wav_16k, language=None, vad_filter=True, word_timestamps=False
     )

@@ -28,8 +28,23 @@ WORKDIR /app
 
 COPY requirements.txt /tmp/requirements.txt
 
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    rustc \
+    cargo \
+    python3.11-dev
+
+    
+RUN curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal --default-toolchain stable \
+    && . "$HOME/.cargo/env" \
+    && rustc --version
+
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+
+
 RUN python3.11 -m pip install -r /tmp/requirements.txt && \
-    rm /tmp/requirements.txt
+    rm -rf /tmp/requirements.txt
 
 COPY app /app/app
 COPY download_models /app/download_models
