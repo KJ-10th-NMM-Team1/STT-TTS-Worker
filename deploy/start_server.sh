@@ -30,8 +30,7 @@ nohup python -u app/worker.py > "$WORKER_LOG" 2> "$WORKER_ERR_LOG" &
 
 
 echo "Life Cycle - ApplicationStart: complete."
-<<<<<<< HEAD
-=======
+
 #!/bin/bash
 
 
@@ -65,4 +64,4 @@ nohup python -u app/worker.py > "$WORKER_LOG" 2> "$WORKER_ERR_LOG" &
 
 
 echo "Life Cycle - ApplicationStart: complete."
->>>>>>> main
+
