@@ -1,8 +1,8 @@
-name: deploy fastAPI
+name: Deploy Worker
 
 on:
   workflow_run:
-    workflows: ["python code style check"] # 이전 워크플로 이름
+    workflows: ["CI"] # 이전 워크플로 이름
     types:
       - completed
     branches:
