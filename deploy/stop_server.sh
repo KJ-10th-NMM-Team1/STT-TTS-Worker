@@ -1,4 +1,6 @@
 #!/bin/bash
+# start_server.sh에서 실행한 uvicorn 프로세스를 찾아서 종료합니다.
+# 'pkill -f'는 전체 명령어 라인('uvicorn main:app ...')을 검색합니다.
 echo "Stopping worker process..."
 echo "FastAPI (uvicorn) 서버를 중지합니다..."
 WORKER_PATTERN="python -u app/worker.py"
