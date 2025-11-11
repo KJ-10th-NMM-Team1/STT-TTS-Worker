@@ -249,10 +249,15 @@ class QueueWorker:
                 except Exception as exc:  # pylint: disable=broad-except
                     logger.exception("Unexpected error handling message: %s", exc)
 
+<<<<<<< HEAD
                 finally:
                     self.sqs.delete_message(
                         QueueUrl=self.queue_url, ReceiptHandle=receipt
                     )
+=======
+                if success:
+                    self._delete_message(receipt)
+>>>>>>> 3c7abc9 (Fix: 세그먼트 미리보기/재번역)
                     logger.info("SQS deleted: %s", msg.get("MessageId"))
 
     def _delete_message(self, receipt: str) -> None:
