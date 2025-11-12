@@ -7,7 +7,8 @@ import boto3
 import requests
 from botocore.exceptions import BotoCoreError, ClientError
 
-from app.config import (
+from app.configs.utils import JobProcessingError, post_status
+from app.configs.env import (
     JOB_QUEUE_URL,
     AWS_REGION,
     AWS_S3_BUCKET,
@@ -15,8 +16,6 @@ from app.config import (
     POLL_WAIT,
     PROFILE,
     VISIBILITY_TIMEOUT,
-    JobProcessingError,
-    post_status,
 )
 from .pipeline.full_pipeline import FullPipeline
 
@@ -90,7 +89,9 @@ class QueueWorker:
                     )
                     self._handle_failure(payload, exc, receive_count)
                 except Exception as exc:  # pylint: disable=broad-except
-                    logger.exception("메시지 처리 중 알 수 없는 오류가 발생했습니다: %s", exc)
+                    logger.exception(
+                        "메시지 처리 중 알 수 없는 오류가 발생했습니다: %s", exc
+                    )
                     wrapped = JobProcessingError(str(exc))
                     self._handle_failure(payload, wrapped, receive_count)
                 else:
@@ -121,8 +122,10 @@ class QueueWorker:
             logger.error("메시지 본문이 잘못되어 삭제합니다: %s", message.get("Body"))
             return None
 
-        if isinstance(body, dict) and "Message" in body and isinstance(
-            body["Message"], str
+        if (
+            isinstance(body, dict)
+            and "Message" in body
+            and isinstance(body["Message"], str)
         ):
             try:
                 return json.loads(body["Message"])
@@ -150,7 +153,7 @@ class QueueWorker:
             "result_key": result.get("result_key"),
             "metadata_key": result.get("metadata_key"),
             "segment_count": result.get("segment_count"),
-            "target_lang": result.get("target_lang"),
+            "target_lang": payload.get("target_lang"),
             "source_lang": result.get("source_lang"),
         }
         try:

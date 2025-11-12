@@ -31,14 +31,14 @@ try:
     from whisperx.diarize import DiarizationPipeline
 except ImportError:  # WhisperX<3.7 fallback
     from whisperx import DiarizationPipeline
-from config import WHISPERX_CACHE_DIR, ensure_job_dirs
-from services.transcript_store import (
+from app.configs.config import WHISPERX_CACHE_DIR, ensure_job_dirs
+from app.services.transcript_store import (
     COMPACT_ARCHIVE_NAME,
     build_compact_transcript,
     save_compact_transcript,
     segment_preview,
 )
-from services.demucs_split import split_vocals
+from app.services.demucs_split import split_vocals
 
 logger = logging.getLogger(__name__)
 
@@ -65,9 +65,11 @@ def run_asr(job_id: str, source_video_path: Path | str | None = None):
         input_video = Path(source_video_path)
     else:
         input_video = paths.input_dir / "source.mp4"
-    
+
     if not input_video.is_file():
-        raise FileNotFoundError(f"Input video not found for job {job_id} at {input_video}")
+        raise FileNotFoundError(
+            f"Input video not found for job {job_id} at {input_video}"
+        )
     raw_audio_path = paths.vid_speaks_dir / "audio.wav"
 
     # 1. 영상에서 오디오 추출 (Whisper 권장 형식: 모노 16kHz)
