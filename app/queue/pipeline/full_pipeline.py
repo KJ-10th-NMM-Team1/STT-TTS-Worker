@@ -200,6 +200,7 @@ class FullPipeline:
                 "segment_count": len(segments_payload),
                 "target_lang": self.target_lang,
                 "source_lang": self.effective_source_lang,
+                "detected_source_lang": self.detected_source_lang,
             }
         except JobProcessingError:
             raise
@@ -260,6 +261,8 @@ class FullPipeline:
             payload["target_lang"] = self.target_lang
         if self.effective_source_lang:
             payload["source_lang"] = self.effective_source_lang
+        if self.detected_source_lang:
+            payload["detected_source_lang"] = self.detected_source_lang
         if self.result_key:
             payload["result_key"] = self.result_key
         if self.metadata_key:
@@ -351,6 +354,7 @@ class FullPipeline:
             "project_id": self.project_id,
             "target_lang": self.target_lang,
             "source_lang": self.effective_source_lang,
+            "detected_source_lang": self.detected_source_lang,
             "input_bucket": self.bucket,
             "input_key": self.input_key,
             "result_bucket": self.output_bucket,

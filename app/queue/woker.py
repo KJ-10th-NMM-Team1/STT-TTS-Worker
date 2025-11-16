@@ -169,6 +169,7 @@ class QueueWorker:
             "segment_count": result.get("segment_count"),
             "target_lang": payload.get("target_lang"),
             "source_lang": result.get("source_lang"),
+            "detected_source_lang": result.get("detected_source_lang"),
         }
         try:
             post_status(

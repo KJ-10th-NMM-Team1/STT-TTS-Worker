@@ -6,19 +6,45 @@ import uuid
 import os
 import logging
 from pathlib import Path
+from typing import Any
 
 import tempfile  # ⬅️ 추가
 import subprocess  # ⬅️ 추가
 from io import BytesIO  # ⬅️ 추가
+import shutil
 
 # 파이프라인 각 단계를 담당하는 함수 불러오기
 from services.stt import run_asr
 from services.demucs_split import split_vocals
 from services.translate import translate_transcript
-from services.tts import generate_tts
+from services.tts import (
+    generate_tts,
+    _transcribe_prompt_text,
+    _synthesize_with_cosyvoice2,
+)
 from services.mux import mux_audio_video
 from services.sync import sync_segments
+from services.lang import normalize_lang_code
+from services.speaker_embeddings import save_audio_embedding, load_embedding_index
+from services.voice_recommendation import (
+    load_voice_library,
+    recommend_voice_replacements,
+    update_voice_library_entry,
+)
 from configs import ensure_data_dirs, ensure_job_dirs
+from pydub import AudioSegment
+
+for name in [
+    "numba",
+    "numba.core",
+    "numba.core.ssa",
+    "numba.core.byteflow",
+    "numba.core.typeinfer",
+]:
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.WARNING)  # or logging.ERROR
+    logger.propagate = False  # 부모(root)로 안 올리게
+    logger.handlers.clear()  # 혹시 자기 handler 갖고 있으면 날려버리기
 
 
 # 문서화를 위한 요청/응답 모델 정의
@@ -41,6 +67,96 @@ app = FastAPI(
 
 # 기본 작업 폴더가 없으면 생성
 ensure_data_dirs()
+
+VOICE_SAMPLES_ROOT = Path(os.getenv("VOICE_SAMPLES_ROOT", "/data/voice-samples"))
+VOICE_SAMPLES_SAMPLES_DIR = VOICE_SAMPLES_ROOT / "samples"
+VOICE_SAMPLES_TTS_DIR = VOICE_SAMPLES_ROOT / "tts"
+VOICE_SAMPLES_EMBED_DIR = VOICE_SAMPLES_ROOT / "embedding"
+for directory in (
+    VOICE_SAMPLES_ROOT,
+    VOICE_SAMPLES_SAMPLES_DIR,
+    VOICE_SAMPLES_TTS_DIR,
+    VOICE_SAMPLES_EMBED_DIR,
+):
+    directory.mkdir(parents=True, exist_ok=True)
+
+
+def _normalize_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _strip_voice_samples_prefix(sample_key: str) -> str:
+    key = sample_key
+    if key.startswith("s3://"):
+        remainder = key.split("://", 1)[1]
+        if "/" in remainder:
+            key = remainder.split("/", 1)[1]
+        else:
+            key = ""
+    marker = "voice-samples/"
+    if marker in key:
+        key = key.split(marker, 1)[1]
+    return key.lstrip("/")
+
+
+def _resolve_local_voice_sample(sample_key: str | None) -> Path | None:
+    if not sample_key:
+        return None
+    relative = _strip_voice_samples_prefix(sample_key)
+    if not relative:
+        return None
+    return (VOICE_SAMPLES_ROOT / relative).resolve()
+
+
+def _prepare_voice_replacements_local(paths, target_lang: str):
+    diagnostics: dict[str, Any] = {
+        "enabled": False,
+        "target_lang": target_lang,
+    }
+    overrides: dict[str, dict] = {}
+    index_path = paths.vid_tts_dir / "speaker_embeddings" / "speaker_embeddings.json"
+    embeddings = load_embedding_index(index_path)
+    if not embeddings:
+        diagnostics["reason"] = "missing_embeddings"
+        return overrides, diagnostics
+    library = load_voice_library(target_lang, VOICE_SAMPLES_EMBED_DIR)
+    if not library:
+        diagnostics["reason"] = "library_unavailable"
+        return overrides, diagnostics
+    replacements = recommend_voice_replacements(
+        embeddings,
+        library,
+        target_lang=target_lang,
+    )
+    if not replacements:
+        diagnostics["reason"] = "no_matches"
+        return overrides, diagnostics
+    matches_summary: dict[str, dict] = {}
+    for speaker, plan in replacements.items():
+        sample_path = _resolve_local_voice_sample(plan.entry.sample_key)
+        if not sample_path or not sample_path.is_file():
+            continue
+        overrides[speaker] = {
+            "audio_path": str(sample_path),
+            "prompt_text": plan.entry.prompt_text,
+            "voice_id": plan.entry.voice_id,
+            "similarity": plan.similarity,
+            "sample_key": plan.entry.sample_key,
+            "sample_bucket": plan.entry.sample_bucket,
+        }
+        matches_summary[speaker] = plan.summary()
+    if not overrides:
+        diagnostics["reason"] = "materialization_failed"
+        return overrides, diagnostics
+    diagnostics["enabled"] = True
+    diagnostics["reason"] = "ok"
+    diagnostics["matches"] = matches_summary
+    diagnostics["prepared_speakers"] = sorted(overrides.keys())
+    return overrides, diagnostics
 
 
 @app.post("/asr", response_model=ASRResponse)
@@ -181,6 +297,7 @@ async def pipeline_endpoint(
     src_lang: str | None = Form(None),
     speaker_count: int | None = Form(None, ge=1),
     prompt_text: str | None = Form(None),
+    replace_voice_samples: bool | str = Form(False),
 ):
     """
     단일 요청으로 전체 파이프라인(ASR → 번역 → TTS → Sync → Mux)을 실행합니다.
@@ -230,11 +347,18 @@ async def pipeline_endpoint(
         user_voice_sample_path = None
 
     prompt_text_value = prompt_text.strip() if prompt_text else None
+    replace_voice_flag = _normalize_bool(replace_voice_samples)
 
     stage = "asr"
     translations: list[dict] = []
     segments_payload: list[dict] = []
     sync_applied = False
+    voice_replacement_meta = {
+        "requested": replace_voice_flag,
+        "enabled": False,
+        "target_lang": target_lang,
+    }
+    speaker_voice_overrides: dict[str, dict] = {}
     try:
         run_asr(
             job_id,
@@ -244,12 +368,23 @@ async def pipeline_endpoint(
         )
         stage = "translate"
         translations = translate_transcript(job_id, target_lang, src_lang=src_lang)
+        if replace_voice_flag:
+            overrides, diagnostics = _prepare_voice_replacements_local(
+                paths, target_lang
+            )
+            speaker_voice_overrides = overrides
+            voice_replacement_meta.update(diagnostics)
+        else:
+            voice_replacement_meta.setdefault("reason", "not_requested")
         stage = "tts"
         segments_payload = generate_tts(
             job_id,
             target_lang,
             voice_sample_path=user_voice_sample_path,
             prompt_text_override=prompt_text_value,
+            speaker_voice_overrides=(
+                speaker_voice_overrides if speaker_voice_overrides else None
+            ),
         )
         stage = "sync"
         try:
@@ -281,6 +416,94 @@ async def pipeline_endpoint(
         "sync_applied": sync_applied,
         "output_video": mux_results["output_video"],
         "output_audio": mux_results["output_audio"],
+        "voice_replacement": voice_replacement_meta,
+    }
+
+
+@app.post("/voice_samples/test")
+async def voice_sample_test_endpoint(
+    file: UploadFile = File(...),
+    text: str = Form(...),
+    sample_lang: str | None = Form(None),
+    voice_sample_id: str | None = Form(None),
+):
+    """
+    Upload a raw voice sample, extract a clean prompt, register it in the local
+    voice-samples directory structure, and synthesize a short TTS preview.
+    """
+    if not file.filename:
+        return JSONResponse(
+            status_code=400, content={"error": "Voice sample file is required."}
+        )
+    job_id = str(uuid.uuid4())
+    paths = ensure_job_dirs(job_id)
+    local_voice_sample = paths.input_dir / "voice_sample.wav"
+    local_voice_sample.parent.mkdir(parents=True, exist_ok=True)
+    sample_bytes = await file.read()
+    with open(local_voice_sample, "wb") as f:
+        f.write(sample_bytes)
+
+    # Trim to 30s max for stability
+    try:
+        audio = AudioSegment.from_file(str(local_voice_sample))
+        max_duration_ms = 30 * 1000
+        if len(audio) > max_duration_ms:
+            audio[:max_duration_ms].export(str(local_voice_sample), format="wav")
+    except Exception as exc:  # pragma: no cover - best-effort
+        logging.warning("Failed to trim voice sample: %s", exc)
+
+    audio_path_for_demucs = paths.vid_speaks_dir / "audio.wav"
+    audio_path_for_demucs.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy(local_voice_sample, audio_path_for_demucs)
+
+    demucs_result = split_vocals(job_id)
+    vocals_path = Path(demucs_result["vocals"])
+
+    lang_code = normalize_lang_code(sample_lang) or "misc"
+    voice_id = voice_sample_id or f"voice_{uuid.uuid4().hex[:10]}"
+
+    sample_dir = VOICE_SAMPLES_SAMPLES_DIR / lang_code
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    sample_output_path = sample_dir / f"{voice_id}.wav"
+    shutil.copy(vocals_path, sample_output_path)
+
+    prompt_text = _transcribe_prompt_text(sample_output_path) or ""
+
+    embedding_tmp = paths.outputs_dir / "voice_sample_embedding.json"
+    embedding_payload = save_audio_embedding(
+        sample_output_path,
+        embedding_tmp,
+        label=voice_id,
+        base_dir=VOICE_SAMPLES_ROOT,
+        meta={"source": "voice_sample_test", "job_id": job_id},
+    )
+    library_entry = {
+        "voice_id": voice_id,
+        "sample_key": f"voice-samples/samples/{lang_code}/{voice_id}.wav",
+        "embedding": embedding_payload.get("embedding", []),
+        "prompt_text": prompt_text,
+    }
+    update_voice_library_entry(
+        lang_code, library_entry, base_dir=VOICE_SAMPLES_EMBED_DIR
+    )
+
+    tts_output_path = VOICE_SAMPLES_TTS_DIR / f"{voice_id}.wav"
+    tts_output_path.parent.mkdir(parents=True, exist_ok=True)
+    _synthesize_with_cosyvoice2(
+        text=text,
+        prompt_text=prompt_text or text,
+        sample_path=sample_output_path,
+        output_path=tts_output_path,
+    )
+
+    return {
+        "job_id": job_id,
+        "voice_id": voice_id,
+        "sample_lang": lang_code,
+        "sample_path": str(sample_output_path),
+        "tts_preview_path": str(tts_output_path),
+        "prompt_text": prompt_text,
+        "library_entry": library_entry,
     }
 
 

@@ -5,9 +5,10 @@
 - 최소 10개 세그먼트 단위 배치 호출.
 - '입력 N개 → 출력 N개'를 seg_idx로 매핑해서 복원.
 - 길이 비율/char_count/2차 보정 호출 제거 → 프롬프트 간단 + MAX_TOKENS 회피.
+- 비동기 병렬 처리 추가 (MT_MAX_CONCURRENT 환경 변수로 제어)
 - ENV: VERTEX_PROJECT_ID, VERTEX_LOCATION, VERTEX_GEMINI_MODEL,
        GOOGLE_APPLICATION_CREDENTIALS 또는 VERTEX_SERVICE_ACCOUNT_JSON/SA_PATH,
-       MT_MIN_BATCH_SIZE(기본 10), MT_BACKEND, MT_STRICT
+       MT_MIN_BATCH_SIZE(기본 10), MT_BACKEND, MT_STRICT, MT_MAX_CONCURRENT(기본 5)
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ import json
 import os
 import shutil
 import logging
+import asyncio
 from typing import Iterable, List, Dict, Any
 
 from configs import get_job_paths
@@ -166,7 +168,7 @@ class GeminiTranslator:
             "- Translate with dubbing in mind.\n"
             "- Idioms can be paraphrased.\n"
             "- translate short texts as briefly as possible.\n"
-            "- For numbers, translate them into their context-sensitive pronunciation.\n"
+            "- For numbers, translate only with the pronunciation that fits the context.\n"
             "- Translate each item from source language to the target language.\n"
             "- Do NOT merge or split items.\n"
             "- Do NOT add explanations, numbering, or any extra text.\n"
@@ -296,6 +298,7 @@ def translate_transcript(job_id: str, target_lang: str, src_lang: str | None = N
 
     - 기본적으로 Vertex AI Gemini 사용(ENV로 모델/리전 지정)
     - 세그먼트를 최소 10개 단위로 묶어 배치 호출
+    - 비동기 병렬 처리로 여러 배치를 동시에 처리 (MT_MAX_CONCURRENT로 제어)
     - 결과를 translated.json으로 저장하고 outputs에도 복사
     """
     paths = get_job_paths(job_id)
@@ -313,6 +316,11 @@ def translate_transcript(job_id: str, target_lang: str, src_lang: str | None = N
     if min_batch < 1:
         min_batch = 10
 
+    # 최대 동시 실행 배치 수 (환경 변수로 제어 가능, 기본값: 5)
+    max_concurrent = int(_env_str("MT_MAX_CONCURRENT", "5") or "5")
+    if max_concurrent < 1:
+        max_concurrent = 5
+
     # 백엔드 선택: 기본 vertex, 환경변수로 강제 가능
     backend = (os.getenv("MT_BACKEND") or "vertex").strip().lower()
     strict = _env_bool("MT_STRICT", True)
@@ -329,12 +337,71 @@ def translate_transcript(job_id: str, target_lang: str, src_lang: str | None = N
                 )
             # 라이브러리/인증 누락 시 폴백 허용
             use_vertex = False
+
     if not use_vertex or translator is None:
-        # 배치 단위로 폴백 번역 수행 후 병합 로직 재사용
-        batch_outputs = []
-        for batch in _chunked(items, size=min_batch):
-            out = _fallback_translate_batch(batch, target_lang, src_lang=src_lang)
-            batch_outputs.append(out)
+        # 배치 단위로 폴백 번역 수행 후 병합 로직 재사용 (비동기 병렬 처리)
+        batches = list(_chunked(items, size=min_batch))
+
+        async def fallback_translate_batch_async(
+            batch: List[Dict[str, Any]],
+        ) -> List[Dict[str, Any]]:
+            """비동기로 폴백 배치 번역 수행"""
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(
+                None, _fallback_translate_batch, batch, target_lang, src_lang
+            )
+
+        async def translate_all_fallback_batches() -> List[List[Dict[str, Any]]]:
+            """모든 폴백 배치를 병렬로 번역 (동시 실행 수 제한)"""
+            semaphore = asyncio.Semaphore(max_concurrent)
+
+            async def translate_with_semaphore(
+                batch: List[Dict[str, Any]],
+            ) -> List[Dict[str, Any]]:
+                async with semaphore:
+                    return await fallback_translate_batch_async(batch)
+
+            tasks = [translate_with_semaphore(batch) for batch in batches]
+            return await asyncio.gather(*tasks)
+
+        # 비동기 실행 (이미 실행 중인 이벤트 루프 처리)
+        logging.info(
+            f"Translating {len(batches)} batches (fallback) with max {max_concurrent} concurrent requests"
+        )
+
+        try:
+            # 이미 실행 중인 이벤트 루프가 있는지 확인
+            running_loop = asyncio.get_running_loop()
+            # 실행 중인 루프가 있으면 nest_asyncio 사용
+            try:
+                import nest_asyncio
+
+                nest_asyncio.apply()
+                batch_outputs = running_loop.run_until_complete(
+                    translate_all_fallback_batches()
+                )
+            except ImportError:
+                # nest_asyncio가 없으면 동기적으로 순차 실행 (폴백)
+                logging.warning(
+                    "nest_asyncio not available and event loop is running. "
+                    "Falling back to sequential translation. "
+                    "Install nest_asyncio for parallel processing: pip install nest_asyncio"
+                )
+                batch_outputs = []
+                for batch in batches:
+                    out = _fallback_translate_batch(
+                        batch, target_lang, src_lang=src_lang
+                    )
+                    batch_outputs.append(out)
+        except RuntimeError:
+            # 실행 중인 루프가 없으면 새로 생성
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+            batch_outputs = loop.run_until_complete(translate_all_fallback_batches())
+
         translated_segments = _merge_batches(items, batch_outputs)
 
         # 결과 저장(폴백도 동일한 경로 유지)
@@ -348,10 +415,65 @@ def translate_transcript(job_id: str, target_lang: str, src_lang: str | None = N
 
     # 여기로 왔으면 Vertex 사용 (translator 준비됨)
 
-    batch_outputs: List[List[Dict[str, Any]]] = []
-    for batch in _chunked(items, size=min_batch):
-        out = translator.translate_batch(batch, target_lang, src_lang=src_lang)
-        batch_outputs.append(out)
+    # 배치를 리스트로 수집
+    batches = list(_chunked(items, size=min_batch))
+
+    # 비동기 병렬 처리
+    async def translate_batch_async(
+        batch: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """비동기로 배치 번역 수행 (스레드 풀 사용)"""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None, translator.translate_batch, batch, target_lang, src_lang
+        )
+
+    async def translate_all_batches() -> List[List[Dict[str, Any]]]:
+        """모든 배치를 병렬로 번역 (동시 실행 수 제한)"""
+        semaphore = asyncio.Semaphore(max_concurrent)
+
+        async def translate_with_semaphore(
+            batch: List[Dict[str, Any]],
+        ) -> List[Dict[str, Any]]:
+            async with semaphore:
+                return await translate_batch_async(batch)
+
+        tasks = [translate_with_semaphore(batch) for batch in batches]
+        return await asyncio.gather(*tasks)
+
+    # 비동기 실행 (이미 실행 중인 이벤트 루프 처리)
+    logging.info(
+        f"Translating {len(batches)} batches with max {max_concurrent} concurrent requests"
+    )
+
+    try:
+        # 이미 실행 중인 이벤트 루프가 있는지 확인
+        running_loop = asyncio.get_running_loop()
+        # 실행 중인 루프가 있으면 nest_asyncio 사용
+        try:
+            import nest_asyncio
+
+            nest_asyncio.apply()
+            batch_outputs = running_loop.run_until_complete(translate_all_batches())
+        except ImportError:
+            # nest_asyncio가 없으면 동기적으로 순차 실행 (폴백)
+            logging.warning(
+                "nest_asyncio not available and event loop is running. "
+                "Falling back to sequential translation. "
+                "Install nest_asyncio for parallel processing: pip install nest_asyncio"
+            )
+            batch_outputs = []
+            for batch in batches:
+                out = translator.translate_batch(batch, target_lang, src_lang=src_lang)
+                batch_outputs.append(out)
+    except RuntimeError:
+        # 실행 중인 루프가 없으면 새로 생성
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        batch_outputs = loop.run_until_complete(translate_all_batches())
 
     translated_segments = _merge_batches(items, batch_outputs)
 

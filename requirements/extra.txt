@@ -4,3 +4,4 @@ pydub==0.25.1
 gTTS==2.5.1
 boto3>=1.34
 requests>=2.31
+nest-asyncio>=1.6.0
