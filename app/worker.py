@@ -217,14 +217,16 @@ def _build_speaker_metadata(
     """
     Collect speaker metadata consisting of speaker name, uploaded sample key,
     and optional prompt text.
+    Returns list format for TTS completion callback.
     """
-    speaker_refs_path = paths.vid_tts_dir / "speaker_refs.json"
-    if not speaker_refs_path.is_file():
+    speaker_refs_json_path = paths.vid_tts_dir / "speaker_refs.json"
+    if not speaker_refs_json_path.is_file():
         return []
+
     try:
-        refs = json.loads(speaker_refs_path.read_text(encoding="utf-8"))
+        refs = json.loads(speaker_refs_json_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        logging.warning("Failed to parse %s: %s", speaker_refs_path, exc)
+        logging.warning("Failed to parse %s: %s", speaker_refs_json_path, exc)
         return []
 
     remote_prefix = f"{project_prefix}/interim/{job_id}"
@@ -267,6 +269,102 @@ def _build_speaker_metadata(
         metadata.append(entry)
 
     return metadata
+
+
+def _build_speaker_refs_metadata(
+    paths: JobPaths,
+    project_prefix: str,
+    job_id: str,
+    output_bucket: str,
+) -> dict:
+    """
+    Upload speaker reference samples to S3 and return metadata in dict format.
+    Returns dict format for final pipeline callback: {"speaker0": {"ref_wav_key": "s3://...", "prompt_text": "..."}}
+    """
+    speaker_refs_metadata = {}
+    tts_dir = paths.vid_tts_dir
+    speaker_ref_dir = tts_dir / "self_refs"
+    speaker_refs_json_path = tts_dir / "speaker_refs.json"
+
+    if not speaker_refs_json_path.is_file():
+        return speaker_refs_metadata
+
+    try:
+        # speaker_refs.json 읽기
+        with open(speaker_refs_json_path, "r", encoding="utf-8") as f:
+            speaker_refs_mapping = json.load(f)
+
+        # self_refs 디렉토리의 모든 wav 파일을 S3에 업로드
+        if speaker_ref_dir.is_dir():
+            for ref_file in speaker_ref_dir.glob("*.wav"):
+                try:
+                    relative_path = ref_file.relative_to(paths.interim_dir)
+                except ValueError:
+                    relative_path = ref_file.relative_to(speaker_ref_dir)
+                    logging.warning(
+                        "Speaker ref 경로 %s 를 interim 디렉터리 기준으로 계산하지 못했습니다. "
+                        "self_refs 디렉터리 상대 경로를 사용합니다.",
+                        ref_file,
+                    )
+                ref_key = f"{project_prefix}/interim/{job_id}/{relative_path}"
+                if upload_to_s3(output_bucket, str(ref_key), ref_file):
+                    logging.info(
+                        f"Speaker ref uploaded to s3://{output_bucket}/{ref_key}"
+                    )
+
+        # speaker_refs.json도 S3에 업로드
+        refs_json_key = f"{project_prefix}/interim/{job_id}/tts/speaker_refs.json"
+        if upload_to_s3(output_bucket, refs_json_key, speaker_refs_json_path):
+            logging.info(
+                f"Speaker refs JSON uploaded to s3://{output_bucket}/{refs_json_key}"
+            )
+
+        # 각 스피커별 ref_wav의 S3 키와 prompt_text를 매핑
+        for speaker, ref_data in speaker_refs_mapping.items():
+            if isinstance(ref_data, dict):
+                audio_path = ref_data.get("audio", "")
+                prompt_text = ref_data.get("text", "")
+                # 상대 경로를 절대 경로로 변환
+                if audio_path and not Path(audio_path).is_absolute():
+                    ref_audio_path = tts_dir / audio_path
+                else:
+                    ref_audio_path = Path(audio_path) if audio_path else None
+
+                if ref_audio_path and ref_audio_path.exists():
+                    try:
+                        relative_path = ref_audio_path.relative_to(paths.interim_dir)
+                    except ValueError:
+                        relative_path = ref_audio_path.relative_to(tts_dir)
+                    ref_s3_key = f"{project_prefix}/interim/{job_id}/{relative_path}"
+                    speaker_refs_metadata[speaker] = {
+                        "ref_wav_key": f"s3://{output_bucket}/{ref_s3_key}",
+                        "prompt_text": prompt_text,
+                    }
+                else:
+                    # 파일이 없으면 speaker_refs.json의 audio 경로를 기반으로 S3 키 생성
+                    if audio_path:
+                        ref_s3_key = (
+                            f"{project_prefix}/interim/{job_id}/tts/{audio_path}"
+                        )
+                        speaker_refs_metadata[speaker] = {
+                            "ref_wav_key": f"s3://{output_bucket}/{ref_s3_key}",
+                            "prompt_text": prompt_text,
+                        }
+            else:
+                logging.warning(
+                    f"Unexpected format for speaker {speaker} in speaker_refs.json"
+                )
+
+        if speaker_refs_metadata:
+            logging.info(
+                f"Prepared speaker_refs metadata for {len(speaker_refs_metadata)} speakers"
+            )
+    except Exception as exc:
+        logging.warning(
+            f"Failed to upload speaker_refs for job {job_id}: {exc}", exc_info=True
+        )
+
+    return speaker_refs_metadata
 
 
 def _parse_positive_int(value, field_name: str) -> int | None:
@@ -577,6 +675,11 @@ def full_pipeline(job_details: dict):
         if not upload_metadata_to_s3(output_bucket, metadata_key, metadata_payload):
             raise Exception("Failed to upload metadata to S3")
 
+        # 10. Speaker reference samples를 S3에 업로드하고 콜백으로 전달
+        speaker_refs_metadata = _build_speaker_refs_metadata(
+            paths, project_prefix, job_id, output_bucket
+        )
+
         final_metadata = {
             "job_id": job_id,
             "project_id": project_id,
@@ -589,6 +692,8 @@ def full_pipeline(job_details: dict):
         }
         if source_lang:
             final_metadata["source_lang"] = source_lang
+        if speaker_refs_metadata:
+            final_metadata["speaker_refs"] = speaker_refs_metadata
 
         send_callback(
             callback_url,
@@ -611,12 +716,11 @@ def full_pipeline(job_details: dict):
 
 def _handle_tts_segments(job_details: dict) -> None:
     """segment_tts / tts 작업을 처리합니다."""
-    job_id = job_details.get("job_id")
     callback_url = job_details.get("callback_url")
     segments_req = job_details.get("segments") or []
 
-    if not job_id or not callback_url:
-        raise ValueError("segment_tts requires both job_id and callback_url.")
+    if not callback_url:
+        raise ValueError("segment_tts requires callback_url.")
     if not segments_req:
         raise ValueError("segment_tts requires at least one segment entry.")
 
@@ -625,19 +729,30 @@ def _handle_tts_segments(job_details: dict) -> None:
     mod_raw = (job_details.get("mod") or "dynamic").strip().lower()
     mod = mod_raw if mod_raw in {"fixed", "dynamic"} else "dynamic"
     output_bucket = job_details.get("output_bucket") or AWS_S3_BUCKET
+
+    # original_job_id가 있으면 사용 (full_pipeline job_id), 없으면 현재 job_id 사용
+    original_job_id = job_details.get("original_job_id") or job_details.get("job_id")
+    if not original_job_id:
+        raise ValueError("segment_tts requires either original_job_id or job_id.")
+
+    # 파일명에 사용할 job_id (현재 job_id)
+    job_id = job_details.get("job_id")
+    if not job_id:
+        raise ValueError("segment_tts requires job_id.")
+
     project_prefix = f"projects/{project_id}" if project_id else "jobs"
-    remote_interim_prefix = f"{project_prefix}/interim/{job_id}"
+    remote_interim_prefix = f"{project_prefix}/interim/{original_job_id}"
 
     send_callback(
         callback_url,
         "in_progress",
-        f"Starting segment TTS for job {job_id}",
+        f"Starting segment TTS for job {original_job_id}",
         stage="segment_tts_started",
-        metadata={"job_id": job_id, "project_id": project_id, "mod": mod},
+        metadata={"job_id": original_job_id, "project_id": project_id, "mod": mod},
     )
 
     try:
-        paths = ensure_job_dirs(job_id)
+        paths = ensure_job_dirs(original_job_id)
         resynth_dir = paths.vid_tts_dir / "resynth"
         resynth_dir.mkdir(parents=True, exist_ok=True)
 
@@ -690,10 +805,10 @@ def _handle_tts_segments(job_details: dict) -> None:
             raise ValueError("Unable to resolve prompt text for TTS segments.")
 
         results: list[dict] = []
-        for idx, seg_req in enumerate(segments_req):
+        for seg_req in segments_req:
             text = (seg_req.get("text") or "").strip()
             if not text:
-                raise ValueError(f"Segment {idx} is missing 'text'.")
+                raise ValueError("Segment is missing 'text'.")
 
             s_val = seg_req.get("s", seg_req.get("start"))
             e_val = seg_req.get("e", seg_req.get("end"))
@@ -712,7 +827,8 @@ def _handle_tts_segments(job_details: dict) -> None:
             s_ms = max(0, int(s_sec * 1000))
             e_ms = int(e_sec * 1000) if e_sec is not None else None
 
-            local_tts = resynth_dir / f"seg_{idx:04d}.wav"
+            # job_id를 파일명에 사용
+            local_tts = resynth_dir / f"{job_id}.wav"
 
             _synthesize_with_cosyvoice2(
                 text=text,
@@ -724,12 +840,12 @@ def _handle_tts_segments(job_details: dict) -> None:
             synced_path = local_tts
             if mod == "fixed":
                 if e_ms is None or e_ms <= s_ms:
-                    raise ValueError(f"Segment {idx} missing valid s/e for fixed mode.")
+                    raise ValueError("Segment missing valid s/e for fixed mode.")
                 target_duration_ms = max(1, e_ms - s_ms)
                 synced_path = _sync_segment_to_range(
                     local_tts,
                     target_duration_ms,
-                    resynth_dir / f"seg_{idx:04d}_synced.wav",
+                    resynth_dir / f"{job_id}_synced.wav",
                 )
 
             try:
@@ -740,11 +856,10 @@ def _handle_tts_segments(job_details: dict) -> None:
                 ) from None
             s3_key = f"{remote_interim_prefix}/{relative.as_posix()}"
             if not upload_to_s3(output_bucket, s3_key, synced_path):
-                raise RuntimeError(f"Failed to upload segment {idx} to S3.")
+                raise RuntimeError("Failed to upload segment to S3.")
 
             results.append(
                 {
-                    "index": idx,
                     "text": text,
                     "s": s_sec,
                     "e": e_sec,
@@ -754,27 +869,36 @@ def _handle_tts_segments(job_details: dict) -> None:
                 }
             )
 
+        # segment_id를 metadata에 포함 (백엔드에서 콜백 처리 시 사용)
+        callback_metadata = {
+            "job_id": original_job_id,
+            "project_id": project_id,
+            "target_lang": target_lang,
+            "mod": mod,
+            "segments": results,
+        }
+        # job_details에서 segment_id가 있으면 metadata에 포함
+        segment_id = job_details.get("segment_id")
+        if segment_id:
+            callback_metadata["segment_id"] = segment_id
+
         send_callback(
             callback_url,
             "done",
             "Segment TTS completed.",
             stage="segment_tts_completed",
-            metadata={
-                "job_id": job_id,
-                "project_id": project_id,
-                "target_lang": target_lang,
-                "mod": mod,
-                "segments": results,
-            },
+            metadata=callback_metadata,
         )
     except Exception as exc:
-        logging.error("segment_tts failed for job %s: %s", job_id, exc, exc_info=True)
+        logging.error(
+            "segment_tts failed for job %s: %s", original_job_id, exc, exc_info=True
+        )
         send_callback(
             callback_url,
             "failed",
             f"Segment TTS failed: {exc}",
             stage="segment_tts_failed",
-            metadata={"job_id": job_id, "project_id": project_id, "mod": mod},
+            metadata={"job_id": original_job_id, "project_id": project_id, "mod": mod},
         )
         raise
 

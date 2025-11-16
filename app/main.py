@@ -1,11 +1,15 @@
 # main.py
 from fastapi import FastAPI, File, UploadFile, Form
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 import uuid
 import os
 import logging
 from pathlib import Path
+
+import tempfile  # ⬅️ 추가
+import subprocess  # ⬅️ 추가
+from io import BytesIO  # ⬅️ 추가
 
 # 파이프라인 각 단계를 담당하는 함수 불러오기
 from services.stt import run_asr
@@ -311,3 +315,98 @@ async def mux_endpoint(job_id: str):
     return FileResponse(
         output_video, media_type="video/mp4", filename=f"dubbed_{job_id}.mp4"
     )
+
+
+@app.post("/demucs_execute")
+async def demucs_execute_endpoint(
+    file: UploadFile = File(...),
+    stem: str = Form("vocals"),  # "vocals", "accompaniment" 등 demucs stem 이름
+):
+    """
+    파일을 업로드하면 demucs로 분리해서,
+    선택한 stem(기본: vocals) 하나를 바로 다운로드로 반환합니다.
+
+    - job_id / 내부 데이터 디렉터리 전혀 사용 안 함
+    - 임시 디렉터리에만 저장 후, 메모리로 읽어서 StreamingResponse로 내려보냄
+    """
+    if not file.filename:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Input audio/video file is required."},
+        )
+
+    stem = stem.lower()
+
+    # demucs 기본 stem 후보들 (환경에 따라 조정 가능)
+    valid_stems = {"vocals", "accompaniment", "bass", "drums", "other"}
+    if stem not in valid_stems:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": f"stem must be one of {sorted(valid_stems)}",
+            },
+        )
+
+    # 1) 임시 디렉터리 안에서만 작업
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+
+            # 업로드 파일 임시 저장
+            input_ext = Path(file.filename).suffix or ".wav"
+            input_path = tmpdir_path / f"input{input_ext}"
+            data = await file.read()
+            with open(input_path, "wb") as f:
+                f.write(data)
+
+            # demucs 출력 디렉터리 지정
+            output_dir = tmpdir_path / "separated"
+
+            # demucs CLI 실행 (이미 컨테이너에 설치되어 있다고 가정)
+            # 필요하면 -n 모델명 등 옵션 추가해서 써도 됨.
+            cmd = [
+                "demucs",
+                "-o",
+                str(output_dir),
+                str(input_path),
+            ]
+
+            try:
+                subprocess.run(cmd, check=True, cwd=tmpdir)
+            except subprocess.CalledProcessError as e:
+                logging.exception("demucs failed")
+                return JSONResponse(
+                    status_code=500, content={"error": f"demucs failed: {e}"}
+                )
+
+            # demucs 출력 구조:
+            # output_dir / MODEL_NAME / BASENAME / "<stem>.wav"
+            candidates = list(output_dir.rglob(f"{stem}.wav"))
+            if not candidates:
+                return JSONResponse(
+                    status_code=500,
+                    content={
+                        "error": f"Could not find separated stem '{stem}.wav' in demucs output."
+                    },
+                )
+
+            stem_path = candidates[0]
+
+            # 파일 내용을 메모리로 읽어온 다음, 임시 디렉터리 삭제
+            with open(stem_path, "rb") as f:
+                audio_bytes = f.read()
+
+        # 2) 임시 디렉터리 밖(이미 삭제된 후)에서 메모리 데이터를 StreamingResponse로 반환
+        download_name = f"{stem}_{Path(file.filename).stem}.wav"
+        return StreamingResponse(
+            BytesIO(audio_bytes),
+            media_type="audio/wav",
+            headers={"Content-Disposition": f'attachment; filename="{download_name}"'},
+        )
+
+    except Exception as exc:
+        logging.exception("demucs_execute failed")
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"demucs_execute failed: {exc}"},
+        )

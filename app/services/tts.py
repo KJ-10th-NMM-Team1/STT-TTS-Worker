@@ -15,6 +15,7 @@ from typing import Dict
 import torch
 import torchaudio
 from pydub import AudioSegment
+from pydub.silence import detect_nonsilent
 from services.self_reference import (
     SpeakerReferenceSample,
     deserialize_reference_mapping,
@@ -72,6 +73,31 @@ PROMPT_STT_DEVICE = (
     os.getenv("COSYVOICE_PROMPT_STT_DEVICE") or DEFAULT_TTS_DEVICE
 ).lower()
 PROMPT_STT_COMPUTE = os.getenv("COSYVOICE_PROMPT_STT_COMPUTE")
+
+
+# ms초 이하 클립은 아예 안 자름
+TRIM_MIN_CLIP_MS = 800
+
+# ms 이상 지속되면 '실제 침묵 구간'으로 본다
+TRIM_MIN_SILENCE_MS = 200
+
+# 평균 볼륨보다 dB 이상 작으면 침묵 후보
+TRIM_SILENCE_DB_DROP = 20.0
+
+# 실제 잘라낼 때 여유로 남겨주는 여백
+TRIM_EDGE_GUARD_MS = 80
+
+# ms 이하이면 '짧은 잡소리 조각'으로 간주
+TRIM_EDGE_ARTIFACT_MS = 320
+
+# 시작/끝에서 ms 범위만 '잡소리 후보'로 본다
+TRIM_EDGE_WINDOW_MS = 900
+
+# VAD에서 ms 이내로 끊기면 한 덩어리로 묶음
+TRIM_VAD_BRIDGE_MS = 220
+
+# VAD 프레임 길이 (30ms)
+TRIM_VAD_FRAME_MS = 30
 
 _PROMPT_CACHE: Dict[str, str] = {}
 
@@ -324,6 +350,160 @@ def _synthesize_with_cosyvoice2(
     torchaudio.save(str(output_path), waveform, sample_rate)
 
 
+def _detect_speech_bounds_vad(segment: AudioSegment) -> tuple[int, int] | None:
+    """
+    Use webrtcvad (if available) to locate the dominant speech window.
+    Returns (start_ms, end_ms) relative to segment start.
+    """
+    try:
+        import webrtcvad  # type: ignore
+    except Exception:
+        return None
+
+    normalized = segment.set_frame_rate(16000).set_channels(1).set_sample_width(2)
+    raw = normalized.raw_data
+    if not raw:
+        return None
+
+    frame_ms = TRIM_VAD_FRAME_MS
+    if frame_ms not in (10, 20, 30):
+        frame_ms = 30
+    frame_samples = int(normalized.frame_rate * frame_ms / 1000)
+    frame_bytes = frame_samples * normalized.sample_width
+    if frame_bytes <= 0:
+        return None
+
+    vad = webrtcvad.Vad(3)
+    speech_ranges: list[list[float]] = []
+    ts = 0.0
+    step_s = frame_ms / 1000.0
+    in_speech = False
+    start_t = 0.0
+
+    for offset in range(0, len(raw), frame_bytes):
+        frame = raw[offset : offset + frame_bytes]
+        if len(frame) < frame_bytes:
+            break
+        try:
+            is_speech = vad.is_speech(frame, normalized.frame_rate)
+        except Exception:
+            break
+        if is_speech and not in_speech:
+            in_speech = True
+            start_t = ts
+        elif (not is_speech) and in_speech:
+            in_speech = False
+            speech_ranges.append([start_t, ts + step_s])
+        ts += step_s
+    if in_speech:
+        speech_ranges.append([start_t, ts])
+    if not speech_ranges:
+        return None
+
+    bridge = max(0.0, TRIM_VAD_BRIDGE_MS / 1000.0)
+    merged: list[list[float]] = []
+    for start, end in speech_ranges:
+        if not merged:
+            merged.append([start, end])
+            continue
+        if start <= merged[-1][1] + bridge:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+
+    start_ms = max(0, int(merged[0][0] * 1000))
+    end_ms = min(len(normalized), int(merged[-1][1] * 1000))
+    if end_ms <= start_ms:
+        return None
+    return start_ms, end_ms
+
+
+def _trim_tts_artifacts(audio_path: Path) -> None:
+    """
+    Remove spurious silence or very short vocal artifacts at clip edges.
+    Uses a simple amplitude-based detector so we do not need extra models.
+    """
+    try:
+        audio = AudioSegment.from_file(str(audio_path))
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning(
+            "Failed to load synthesized clip for trimming (%s): %s", audio_path, exc
+        )
+        return
+
+    duration_ms = len(audio)
+    if duration_ms <= TRIM_MIN_CLIP_MS:
+        return
+
+    base_db = audio.dBFS if audio.dBFS != float("-inf") else -60.0
+    silence_thresh = max(base_db - TRIM_SILENCE_DB_DROP, -75.0)
+    non_silence_spans = detect_nonsilent(
+        audio,
+        min_silence_len=TRIM_MIN_SILENCE_MS,
+        silence_thresh=silence_thresh,
+        seek_step=15,
+    )
+    if not non_silence_spans:
+        logger.debug(
+            "Non-speech only clip detected while trimming %s; skipping.", audio_path
+        )
+        return
+
+    trimmed = False
+    spans = non_silence_spans
+
+    # Drop very short leading artifacts that hug the start of the clip.
+    while (
+        len(spans) > 1
+        and spans[0][0] <= TRIM_EDGE_WINDOW_MS
+        and (spans[0][1] - spans[0][0]) <= TRIM_EDGE_ARTIFACT_MS
+    ):
+        spans = spans[1:]
+        trimmed = True
+
+    # Drop very short trailing artifacts stuck to the end.
+    while (
+        len(spans) > 1
+        and (duration_ms - spans[-1][1]) <= TRIM_EDGE_WINDOW_MS
+        and (spans[-1][1] - spans[-1][0]) <= TRIM_EDGE_ARTIFACT_MS
+    ):
+        spans = spans[:-1]
+        trimmed = True
+
+    if not spans:
+        return
+
+    keep_start = max(0, spans[0][0] - TRIM_EDGE_GUARD_MS)
+    keep_end = min(duration_ms, spans[-1][1] + TRIM_EDGE_GUARD_MS)
+    if keep_end - keep_start <= 0:
+        return
+
+    trimmed = trimmed or keep_start > 0 or keep_end < duration_ms
+
+    # Secondary, speech-aware clamp using VAD (when available)
+    candidate = audio[keep_start:keep_end]
+    speech_bounds = _detect_speech_bounds_vad(candidate)
+    if speech_bounds:
+        local_start = max(0, speech_bounds[0] - TRIM_EDGE_GUARD_MS)
+        local_end = min(len(candidate), speech_bounds[1] + TRIM_EDGE_GUARD_MS)
+        if local_end > local_start:
+            abs_start = keep_start + local_start
+            abs_end = keep_start + (local_end)
+            trimmed = trimmed or abs_start > keep_start or abs_end < keep_end
+            keep_start, keep_end = abs_start, abs_end
+
+    if not trimmed:
+        return
+
+    cleaned = audio[keep_start:keep_end]
+    cleaned.export(str(audio_path), format="wav")
+    logger.debug(
+        "Trimmed TTS clip %s (removed %.0f ms)",
+        audio_path,
+        (keep_start + (duration_ms - keep_end)),
+    )
+
+
 def generate_tts(
     job_id: str,
     target_lang: str,
@@ -402,8 +582,9 @@ def generate_tts(
         else:
             logger.warning("제공된 보이스 샘플을 찾을 수 없습니다: %s", candidate)
 
-    synthesized_segments = []
-    for seg in base_segments:
+    segment_lookup = {seg.idx: seg for seg in base_segments}
+
+    def _synthesize_segment(seg) -> dict:
         override = translation_map.get(seg.idx, {})
         text = override.get("translation") or seg.text
         speaker = override.get("speaker") or seg.speaker
@@ -450,22 +631,92 @@ def generate_tts(
             sample_path=effective_sample,
             output_path=output_file,
         )
+        _trim_tts_artifacts(output_file)
 
-        synthesized_segments.append(
-            {
-                "segment_id": seg.segment_id(),
-                "seg_idx": seg.idx,
-                "speaker": speaker,
-                "start": segment_start,
-                "end": segment_end,
-                "target_duration": duration,
-                "audio_file": str(output_file),
-                "voice_sample": str(effective_sample),
-                "prompt_text": prompt_text,
-                "tts_backend": "cosyvoice2",
-                "source_text": seg.text,
-            }
-        )
+        # --- 길이 기반 품질 체크 ---
+        tts_status = "ok"
+        quality_note = None
+        try:
+            clip = AudioSegment.from_file(str(output_file))
+            dur_ms = len(clip)
+            target_ms = int(duration * 1000)
+            if target_ms > 0:
+                ratio = dur_ms / target_ms
+            else:
+                ratio = 1.0
+
+            # 타겟 대비 비정상적으로 짧거나 긴 경우
+            if target_ms > 0 and (ratio < 0.4 or ratio > 2.5):
+                tts_status = "suspect_duration"
+                quality_note = (
+                    f"ratio={ratio:.2f}, dur={dur_ms}ms, target={target_ms}ms"
+                )
+                logger.warning(
+                    "TTS duration looks off for seg_idx=%s (%s)",
+                    seg.idx,
+                    quality_note,
+                )
+        except Exception as exc:
+            logger.warning(
+                "Failed to inspect TTS duration for %s: %s", output_file, exc
+            )
+
+        return {
+            "segment_id": seg.segment_id(),
+            "seg_idx": seg.idx,
+            "speaker": speaker,
+            "start": segment_start,
+            "end": segment_end,
+            "target_duration": duration,
+            "audio_file": str(output_file),
+            "voice_sample": str(effective_sample),
+            "prompt_text": prompt_text,
+            "tts_backend": "cosyvoice2",
+            "source_text": seg.text,
+            "tts_status": tts_status,
+            "quality_note": quality_note,
+        }
+
+    synthesized_segments: list[dict] = []
+    suspect_indices: list[int] = []
+    index_by_seg_idx: Dict[int, int] = {}
+    for seg in base_segments:
+        entry = _synthesize_segment(seg)
+        index = len(synthesized_segments)
+        synthesized_segments.append(entry)
+        index_by_seg_idx[seg.idx] = index
+        if entry.get("tts_status") == "suspect_duration":
+            suspect_indices.append(seg.idx)
+
+    if suspect_indices:
+        remaining = suspect_indices
+        max_retry = 1
+        for attempt in range(max_retry):
+            next_round: list[int] = []
+            logger.info(
+                "Retrying TTS for %d suspect segments (attempt %d/%d): %s",
+                len(remaining),
+                attempt + 1,
+                max_retry,
+                remaining,
+            )
+            for seg_idx in remaining:
+                seg_obj = segment_lookup.get(seg_idx)
+                if not seg_obj:
+                    continue
+                updated_entry = _synthesize_segment(seg_obj)
+                pos = index_by_seg_idx.get(seg_idx)
+                if pos is not None:
+                    synthesized_segments[pos] = updated_entry
+                if updated_entry.get("tts_status") == "suspect_duration":
+                    next_round.append(seg_idx)
+            if not next_round:
+                break
+            remaining = next_round
+        if remaining:
+            logger.warning(
+                "Segments still flagged as suspect after retry: %s", remaining
+            )
     meta_path = tts_dir / "segments.json"
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(synthesized_segments, f, ensure_ascii=False, indent=2)
