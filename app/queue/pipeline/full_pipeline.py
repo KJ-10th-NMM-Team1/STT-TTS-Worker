@@ -16,10 +16,15 @@ try:
         LOG_LEVEL,
     )
     from app.configs.utils import JobProcessingError, post_status
+    from app.services.lang import normalize_lang_code
     from app.services.mux import mux_audio_video
     from app.services.stt import run_asr
     from app.services.sync import sync_segments
     from app.services.translate import translate_transcript
+    from app.services.transcript_store import (
+        COMPACT_ARCHIVE_NAME,
+        read_transcript_language,
+    )
     from app.services.tts import generate_tts
 except ModuleNotFoundError as exc:
     if exc.name != "app":
@@ -32,10 +37,15 @@ except ModuleNotFoundError as exc:
         LOG_LEVEL,
     )
     from configs.utils import JobProcessingError, post_status
+    from services.lang import normalize_lang_code
     from services.mux import mux_audio_video
     from services.stt import run_asr
     from services.sync import sync_segments
     from services.translate import translate_transcript
+    from services.transcript_store import (
+        COMPACT_ARCHIVE_NAME,
+        read_transcript_language,
+    )
     from services.tts import generate_tts
 
 
@@ -75,7 +85,9 @@ class FullPipeline:
         self.input_key = (payload.get("input_key") or "").strip()
         self.callback_url = (payload.get("callback_url") or "").strip()
         self.target_lang = (payload.get("target_lang") or DEFAULT_TARGET_LANG).strip()
-        self.source_lang = (payload.get("source_lang") or DEFAULT_SOURCE_LANG).strip()
+        self.source_lang = normalize_lang_code(
+            payload.get("source_lang") or DEFAULT_SOURCE_LANG
+        )
         self.speaker_count = self._parse_speaker_count(payload.get("speaker_count"))
         self.voice_sample_key = payload.get("voice_sample_key")
         self.voice_sample_bucket = payload.get("voice_sample_bucket") or self.bucket
@@ -95,6 +107,8 @@ class FullPipeline:
 
         self.paths = ensure_job_dirs(self.job_id) if self.job_id else None
         self.local_input = None
+        self.detected_source_lang: Optional[str] = None
+        self.effective_source_lang: Optional[str] = self.source_lang
 
     def process(self) -> Dict[str, Any]:
         self._validate_payload()
@@ -114,10 +128,21 @@ class FullPipeline:
                 source_lang=self.source_lang,
                 speaker_count=self.speaker_count,
             )
+            transcript_path = self.paths.src_sentence_dir / COMPACT_ARCHIVE_NAME
+            self.detected_source_lang = read_transcript_language(transcript_path)
+            if (
+                self.effective_source_lang is None
+                and self.detected_source_lang is not None
+            ):
+                self.effective_source_lang = self.detected_source_lang
             self._post_stage("stt_completed")
 
             self._post_stage("mt_prepare")
-            translations = translate_transcript(self.job_id, self.target_lang)
+            translations = translate_transcript(
+                self.job_id,
+                self.target_lang,
+                src_lang=self.effective_source_lang,
+            )
             self._post_stage("mt_completed", {"segments_translated": len(translations)})
 
             voice_sample_path = self._prepare_voice_sample()
@@ -174,7 +199,7 @@ class FullPipeline:
                 "segments": segments_payload,
                 "segment_count": len(segments_payload),
                 "target_lang": self.target_lang,
-                "source_lang": self.source_lang,
+                "source_lang": self.effective_source_lang,
             }
         except JobProcessingError:
             raise
@@ -233,8 +258,8 @@ class FullPipeline:
             payload["project_id"] = self.project_id
         if self.target_lang:
             payload["target_lang"] = self.target_lang
-        if self.source_lang:
-            payload["source_lang"] = self.source_lang
+        if self.effective_source_lang:
+            payload["source_lang"] = self.effective_source_lang
         if self.result_key:
             payload["result_key"] = self.result_key
         if self.metadata_key:
@@ -325,7 +350,7 @@ class FullPipeline:
             "job_id": self.job_id,
             "project_id": self.project_id,
             "target_lang": self.target_lang,
-            "source_lang": self.source_lang,
+            "source_lang": self.effective_source_lang,
             "input_bucket": self.bucket,
             "input_key": self.input_key,
             "result_bucket": self.output_bucket,

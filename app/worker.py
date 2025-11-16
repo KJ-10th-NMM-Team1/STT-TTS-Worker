@@ -10,6 +10,7 @@ import requests
 from botocore.exceptions import ClientError, BotoCoreError
 
 # 워커의 서비스 모듈들
+from services.lang import normalize_lang_code
 from services.stt import run_asr
 from services.translate import translate_transcript
 from services.tts import generate_tts
@@ -18,6 +19,7 @@ from services.mux import mux_audio_video
 from configs import JobPaths, ensure_job_dirs
 from services.demucs_split import split_vocals
 from services.tts import _transcribe_prompt_text, _synthesize_with_cosyvoice2
+from services.transcript_store import COMPACT_ARCHIVE_NAME, read_transcript_language
 from pydub import AudioSegment
 import shutil
 
@@ -392,7 +394,7 @@ def full_pipeline(job_details: dict):
     callback_url = job_details["callback_url"]
 
     target_lang = job_details.get("target_lang", "en")
-    source_lang = job_details.get("source_lang")
+    source_lang = normalize_lang_code(job_details.get("source_lang"))
     speaker_count = _parse_positive_int(
         job_details.get("speaker_count"), "speaker_count"
     )
@@ -465,6 +467,8 @@ def full_pipeline(job_details: dict):
     segments_payload: list[dict] = []
     speaker_metadata: list[dict] = []
     final_audio_path: Path | None = None
+    detected_source_lang: str | None = None
+    effective_source_lang: str | None = source_lang
 
     try:
         # 4. ASR (STT)
@@ -478,14 +482,15 @@ def full_pipeline(job_details: dict):
             speaker_count=speaker_count,
         )
         # ASR 결과물(compact transcript)을 S3에 업로드
-        from services.transcript_store import COMPACT_ARCHIVE_NAME
-
         asr_result_path = paths.src_sentence_dir / COMPACT_ARCHIVE_NAME
         upload_to_s3(
             output_bucket,
             f"{project_prefix}/interim/{job_id}/{COMPACT_ARCHIVE_NAME}",
             asr_result_path,
         )
+        detected_source_lang = read_transcript_language(asr_result_path)
+        if effective_source_lang is None and detected_source_lang:
+            effective_source_lang = detected_source_lang
         # 원본 오디오(audio.wav)를 S3에 업로드
         raw_audio_path = paths.vid_speaks_dir / "audio.wav"
         audio_key = None
@@ -542,7 +547,9 @@ def full_pipeline(job_details: dict):
             "Starting translation...",
             stage="translation_started",
         )
-        translations = translate_transcript(job_id, target_lang, src_lang=source_lang)
+        translations = translate_transcript(
+            job_id, target_lang, src_lang=effective_source_lang
+        )
         # 번역 결과물(translated.json)을 S3에 업로드
         trans_result_path = paths.trg_sentence_dir / "translated.json"
         upload_to_s3(
@@ -657,7 +664,7 @@ def full_pipeline(job_details: dict):
             "job_id": job_id,
             "project_id": project_id,
             "target_lang": target_lang,
-            "source_lang": source_lang,
+            "source_lang": effective_source_lang,
             "input_bucket": input_bucket,
             "input_key": input_key,
             "result_bucket": output_bucket,
@@ -690,8 +697,8 @@ def full_pipeline(job_details: dict):
             "speaker_count": len(speaker_metadata),
             "target_lang": target_lang,
         }
-        if source_lang:
-            final_metadata["source_lang"] = source_lang
+        if effective_source_lang:
+            final_metadata["source_lang"] = effective_source_lang
         if speaker_refs_metadata:
             final_metadata["speaker_refs"] = speaker_refs_metadata
 

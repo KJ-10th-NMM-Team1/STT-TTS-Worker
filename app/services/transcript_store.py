@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Sequence
 
+from services.lang import normalize_lang_code
+
 SCHEMA_VERSION = 1
 # 기본 저장 포맷을 gzip(.gz)에서 평문 JSON(.json)으로 변경
 # 기존 .gz 파일과의 호환을 위해 로드 시 자동 폴백을 지원합니다.
@@ -311,3 +313,13 @@ def segment_views(bundle: dict) -> List[SegmentView]:
 
 def segment_preview(bundle: dict) -> list[dict]:
     return [view.to_public_dict() for view in segment_views(bundle)]
+
+
+def read_transcript_language(transcript_path: Path) -> str | None:
+    """Load a compact transcript and return its normalized language code."""
+
+    try:
+        bundle = load_compact_transcript(transcript_path)
+    except FileNotFoundError:
+        return None
+    return normalize_lang_code(bundle.get("lang"))

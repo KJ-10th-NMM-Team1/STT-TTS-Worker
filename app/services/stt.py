@@ -40,6 +40,7 @@ except ModuleNotFoundError as exc:  # allow running when /app is the root
     if exc.name != "app":
         raise
     from configs import WHISPERX_CACHE_DIR, ensure_job_dirs
+from services.lang import normalize_lang_code
 from services.transcript_store import (
     COMPACT_ARCHIVE_NAME,
     build_compact_transcript,
@@ -63,65 +64,6 @@ def _whisperx_download_root(subdir: str) -> str:
     return str(path)
 
 
-def _normalize_lang_code(value: str | None) -> str | None:
-    """Normalize various language inputs to 2-letter ISO codes used by Whisper/WhisperX.
-
-    Accepts values like 'ko', 'ko-KR', 'KO_kr', or common names like 'korean'.
-    Returns a lowercased 2-letter code, or None if cannot confidently map.
-    """
-    if not value:
-        return None
-    v = str(value).strip().lower()
-    if not v or v == "auto" or v == "none" or v == "null":
-        return None
-    v = v.replace("_", "-")
-    # locale -> base
-    if "-" in v:
-        v = v.split("-", 1)[0]
-    # common aliases
-    alias = {
-        "kr": "ko",
-        "jp": "ja",
-        "cn": "zh",
-        "tw": "zh",
-        "ua": "uk",
-        "he": "he",  # keep as-is for clarity
-    }
-    names = {
-        "english": "en",
-        "korean": "ko",
-        "japanese": "ja",
-        "chinese": "zh",
-        "mandarin": "zh",
-        "cantonese": "zh",
-        "german": "de",
-        "french": "fr",
-        "spanish": "es",
-        "portuguese": "pt",
-        "brazilian": "pt",
-        "russian": "ru",
-        "arabic": "ar",
-        "hindi": "hi",
-        "vietnamese": "vi",
-        "indonesian": "id",
-        "thai": "th",
-        "turkish": "tr",
-        "italian": "it",
-        "polish": "pl",
-        "ukrainian": "uk",
-        "dutch": "nl",
-        "hebrew": "he",
-    }
-    if v in names:
-        return names[v]
-    if v in alias:
-        return alias[v]
-    # assume 2-letter ISO code
-    if len(v) == 2 and v.isalpha():
-        return v
-    return None
-
-
 def run_asr(
     job_id: str,
     source_video_path: Path | str | None = None,
@@ -138,7 +80,7 @@ def run_asr(
         speaker_count: pyannote diarization이 예상 화자 수를 고정할 수 있도록 전달합니다.
             1 이상의 정수를 지정하면 num_speakers hint로 전달되며, 생략하면 자동 추정합니다.
     """
-    lang_override = _normalize_lang_code(source_lang)
+    lang_override = normalize_lang_code(source_lang)
     normalized_speaker_count = None
     if speaker_count is not None:
         if speaker_count < 1:
@@ -247,7 +189,7 @@ def run_asr(
     }
 
     # 4. 정밀한 타이밍을 위한 정렬 모델 로드
-    language_code = _normalize_lang_code(result.get("language")) or lang_override
+    language_code = normalize_lang_code(result.get("language")) or lang_override
     logger.info("Loading alignment model for language=%s", language_code)
     align_kwargs = {
         "language_code": language_code,
