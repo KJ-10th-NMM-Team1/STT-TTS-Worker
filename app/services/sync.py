@@ -81,10 +81,12 @@ def _sync_single_segment(
     stretched = _time_stretch(audio_path, rate)
     if len(stretched) <= 0:
         raise RuntimeError("시간 조정 결과가 비정상입니다.")
-    padding_ms = 0
-    if hit_slow_cap and len(stretched) < target_ms:
-        padding_ms = target_ms - len(stretched)
-        stretched += AudioSegment.silent(duration=padding_ms)
+
+    # 무음 패딩
+    # padding_ms = 0
+    # if hit_slow_cap and len(stretched) < target_ms:
+    #     padding_ms = target_ms - len(stretched)
+    #     stretched += AudioSegment.silent(duration=padding_ms)
     return stretched, ratio_to_apply, padding_ms, current_ms
 
 

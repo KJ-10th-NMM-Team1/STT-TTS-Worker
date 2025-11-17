@@ -16,7 +16,7 @@ from services.lang import normalize_lang_code
 from services.stt import run_asr
 from services.translate import translate_transcript
 from services.tts import generate_tts
-from services.sync import sync_segments
+from services.sync import sync_segments, _sync_single_segment, MAX_SLOW_RATIO
 from services.mux import mux_audio_video
 from configs import JobPaths, ensure_job_dirs
 from services.demucs_split import split_vocals
@@ -202,27 +202,22 @@ def _sync_segment_to_range(
     input_path: Path, target_duration_ms: int, output_path: Path
 ) -> Path:
     """
-    Coerce a single TTS clip to the requested duration by trimming or padding silence.
+    segment_tts의 fixed 모드에서 사용할 길이 보정:
+    - sync.py와 동일하게 pyrubberband로 tempo 조절
+    - 너무 많이 느려지는 건 MAX_SLOW_RATIO까지만 허용
     """
     if target_duration_ms <= 0:
         raise ValueError("target_duration_ms must be positive")
 
-    audio = AudioSegment.from_file(str(input_path))
-    current_ms = len(audio)
-    if current_ms == target_duration_ms:
-        if input_path != output_path:
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(input_path, output_path)
-        return output_path
-
-    if current_ms > target_duration_ms:
-        processed = audio[:target_duration_ms]
-    else:
-        silence = AudioSegment.silent(duration=target_duration_ms - current_ms)
-        processed = audio + silence
+    # sync.py의 시간 보정 로직 재사용
+    synced_audio, ratio_applied, padding_ms, original_ms = _sync_single_segment(
+        input_path,
+        target_ms=target_duration_ms,
+        allow_ratio=MAX_SLOW_RATIO,
+    )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    processed.export(str(output_path), format="wav")
+    synced_audio.export(str(output_path), format="wav")
     return output_path
 
 
@@ -582,7 +577,7 @@ def full_pipeline(job_details: dict):
     voice_config = job_details.get("voice_config")
     voice_replacement_flag = (
         job_details.get("replace_voice_samples")
-        or job_details.get("use_voice_replacement")
+        or job_details.get("is_replace_voice_samples")
         or job_details.get("voice_sample_substitution")
     )
     replace_voice_samples = _parse_bool(voice_replacement_flag)

@@ -65,7 +65,7 @@ except Exception as exc:  # noqa: F841
     COSYVOICE_AVAILABLE = False
 
 
-PROMPT_STT_MODEL_ID = os.getenv("COSYVOICE_PROMPT_STT_MODEL", "large-v3")
+PROMPT_STT_MODEL_ID = os.getenv("COSYVOICE_PROMPT_STT_MODEL", "large-v3-turbo")
 DEFAULT_TTS_DEVICE = (
     os.getenv("TTS_DEVICE") or ("cuda" if torch.cuda.is_available() else "cpu")
 ).lower()
@@ -76,7 +76,7 @@ PROMPT_STT_COMPUTE = os.getenv("COSYVOICE_PROMPT_STT_COMPUTE")
 
 
 # ms초 이하 클립은 아예 안 자름
-TRIM_MIN_CLIP_MS = 800
+TRIM_MIN_CLIP_MS = 1000
 
 # ms 이상 지속되면 '실제 침묵 구간'으로 본다
 TRIM_MIN_SILENCE_MS = 120
@@ -85,7 +85,7 @@ TRIM_MIN_SILENCE_MS = 120
 TRIM_SILENCE_DB_DROP = 18.0
 
 # 실제 잘라낼 때 여유로 남겨주는 여백
-TRIM_EDGE_GUARD_MS = 80
+TRIM_EDGE_GUARD_MS = 350
 
 # ms 이하이면 '짧은 잡소리 조각'으로 간주
 TRIM_EDGE_ARTIFACT_MS = 320
@@ -134,7 +134,7 @@ def _get_cosyvoice2():
 
 @lru_cache(maxsize=1)
 def _get_prompt_stt_model():
-    """Load the fast-whisper model (large-v3 by default) for prompt extraction."""
+    """Load the fast-whisper model (large-v3-turbo by default) for prompt extraction."""
     from faster_whisper import WhisperModel
 
     device = PROMPT_STT_DEVICE if torch.cuda.is_available() else "cpu"

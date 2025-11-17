@@ -48,7 +48,10 @@ from services.transcript_store import (
     segment_preview,
     segment_views,
 )
-from services.self_reference import prepare_self_reference_samples, serialize_reference_mapping
+from services.self_reference import (
+    prepare_self_reference_samples,
+    serialize_reference_mapping,
+)
 from services.speaker_embeddings import build_reference_embeddings
 from services.demucs_split import split_vocals
 
@@ -137,7 +140,7 @@ def run_asr(
     )
     try:
         model = whisperx.load_model(
-            "large-v3",
+            "large-v3-turbo",
             device=device,
             compute_type=compute_type,
             download_root=_whisperx_download_root("asr"),
@@ -153,7 +156,7 @@ def run_asr(
             fallback_compute,
         )
         model = whisperx.load_model(
-            "large-v3",
+            "large-v3-turbo",
             device=device,
             compute_type=fallback_compute,
             download_root=_whisperx_download_root("asr"),
