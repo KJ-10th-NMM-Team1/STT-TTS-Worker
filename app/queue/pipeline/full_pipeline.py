@@ -7,19 +7,46 @@ from typing import Any, Dict, Optional
 
 from botocore.exceptions import BotoCoreError, ClientError
 
-from app.configs.config import ensure_job_dirs
-from app.configs.env import (
-    AWS_S3_BUCKET,
-    DEFAULT_SOURCE_LANG,
-    DEFAULT_TARGET_LANG,
-    LOG_LEVEL,
-)
-from app.configs.utils import JobProcessingError, post_status
-from app.services.mux import mux_audio_video
-from app.services.stt import run_asr
-from app.services.sync import sync_segments
-from app.services.translate import translate_transcript
-from app.services.tts import generate_tts
+try:
+    from app.configs import ensure_job_dirs
+    from app.configs.env import (
+        AWS_S3_BUCKET,
+        DEFAULT_SOURCE_LANG,
+        DEFAULT_TARGET_LANG,
+        LOG_LEVEL,
+    )
+    from app.configs.utils import JobProcessingError, post_status
+    from app.services.lang import normalize_lang_code
+    from app.services.mux import mux_audio_video
+    from app.services.stt import run_asr
+    from app.services.sync import sync_segments
+    from app.services.translate import translate_transcript
+    from app.services.transcript_store import (
+        COMPACT_ARCHIVE_NAME,
+        read_transcript_language,
+    )
+    from app.services.tts import generate_tts
+except ModuleNotFoundError as exc:
+    if exc.name != "app":
+        raise
+    from configs import ensure_job_dirs
+    from configs.env import (
+        AWS_S3_BUCKET,
+        DEFAULT_SOURCE_LANG,
+        DEFAULT_TARGET_LANG,
+        LOG_LEVEL,
+    )
+    from configs.utils import JobProcessingError, post_status
+    from services.lang import normalize_lang_code
+    from services.mux import mux_audio_video
+    from services.stt import run_asr
+    from services.sync import sync_segments
+    from services.translate import translate_transcript
+    from services.transcript_store import (
+        COMPACT_ARCHIVE_NAME,
+        read_transcript_language,
+    )
+    from services.tts import generate_tts
 
 
 logger = logging.getLogger(__name__)
@@ -58,7 +85,10 @@ class FullPipeline:
         self.input_key = (payload.get("input_key") or "").strip()
         self.callback_url = (payload.get("callback_url") or "").strip()
         self.target_lang = (payload.get("target_lang") or DEFAULT_TARGET_LANG).strip()
-        self.source_lang = (payload.get("source_lang") or DEFAULT_SOURCE_LANG).strip()
+        self.source_lang = normalize_lang_code(
+            payload.get("source_lang") or DEFAULT_SOURCE_LANG
+        )
+        self.speaker_count = self._parse_speaker_count(payload.get("speaker_count"))
         self.voice_sample_key = payload.get("voice_sample_key")
         self.voice_sample_bucket = payload.get("voice_sample_bucket") or self.bucket
         self.voice_sample_path_hint = payload.get("voice_sample_path")
@@ -77,6 +107,8 @@ class FullPipeline:
 
         self.paths = ensure_job_dirs(self.job_id) if self.job_id else None
         self.local_input = None
+        self.detected_source_lang: Optional[str] = None
+        self.effective_source_lang: Optional[str] = self.source_lang
 
     def process(self) -> Dict[str, Any]:
         self._validate_payload()
@@ -91,11 +123,26 @@ class FullPipeline:
             )
 
             # 2) ASR → 번역 → TTS → 싱크 순서로 미디어를 준비한다.
-            run_asr(self.job_id)
+            run_asr(
+                self.job_id,
+                source_lang=self.source_lang,
+                speaker_count=self.speaker_count,
+            )
+            transcript_path = self.paths.src_sentence_dir / COMPACT_ARCHIVE_NAME
+            self.detected_source_lang = read_transcript_language(transcript_path)
+            if (
+                self.effective_source_lang is None
+                and self.detected_source_lang is not None
+            ):
+                self.effective_source_lang = self.detected_source_lang
             self._post_stage("stt_completed")
 
             self._post_stage("mt_prepare")
-            translations = translate_transcript(self.job_id, self.target_lang)
+            translations = translate_transcript(
+                self.job_id,
+                self.target_lang,
+                src_lang=self.effective_source_lang,
+            )
             self._post_stage("mt_completed", {"segments_translated": len(translations)})
 
             voice_sample_path = self._prepare_voice_sample()
@@ -152,7 +199,8 @@ class FullPipeline:
                 "segments": segments_payload,
                 "segment_count": len(segments_payload),
                 "target_lang": self.target_lang,
-                "source_lang": self.source_lang,
+                "source_lang": self.effective_source_lang,
+                "detected_source_lang": self.detected_source_lang,
             }
         except JobProcessingError:
             raise
@@ -182,6 +230,25 @@ class FullPipeline:
             return f"projects/{self.project_id}/{self.job_id}"
         return f"jobs/{self.job_id}"
 
+    def _parse_speaker_count(self, raw_value) -> Optional[int]:
+        if raw_value in (None, ""):
+            return None
+        try:
+            parsed = int(raw_value)
+        except (TypeError, ValueError):
+            logger.warning(
+                "speaker_count=%r 를 정수로 파싱하지 못했습니다. 자동 추정으로 진행합니다.",
+                raw_value,
+            )
+            return None
+        if parsed < 1:
+            logger.warning(
+                "speaker_count=%r 는 1 이상이어야 합니다. 자동 추정으로 진행합니다.",
+                raw_value,
+            )
+            return None
+        return parsed
+
     def _post_stage(
         self, stage: str, metadata: Optional[Dict[str, Any]] = None
     ) -> None:
@@ -192,8 +259,10 @@ class FullPipeline:
             payload["project_id"] = self.project_id
         if self.target_lang:
             payload["target_lang"] = self.target_lang
-        if self.source_lang:
-            payload["source_lang"] = self.source_lang
+        if self.effective_source_lang:
+            payload["source_lang"] = self.effective_source_lang
+        if self.detected_source_lang:
+            payload["detected_source_lang"] = self.detected_source_lang
         if self.result_key:
             payload["result_key"] = self.result_key
         if self.metadata_key:
@@ -279,18 +348,54 @@ class FullPipeline:
         translations: list[Dict[str, Any]],
         audio_path: Path,
     ) -> Dict[str, Any]:
+        normalized_segments = self._segments_with_remote_audio(segments)
         return {
             "job_id": self.job_id,
             "project_id": self.project_id,
             "target_lang": self.target_lang,
-            "source_lang": self.source_lang,
+            "source_lang": self.effective_source_lang,
+            "detected_source_lang": self.detected_source_lang,
             "input_bucket": self.bucket,
             "input_key": self.input_key,
             "result_bucket": self.output_bucket,
             "result_key": self.result_key,
             "metadata_key": self.metadata_key,
-            "segments": segments,
-            "segment_count": len(segments),
+            "segments": normalized_segments,
+            "segment_count": len(normalized_segments),
             "translations": translations,
             "audio_artifact": str(audio_path),
         }
+
+    def _segments_with_remote_audio(
+        self, segments: list[Dict[str, Any]]
+    ) -> list[Dict[str, Any]]:
+        if not segments:
+            return []
+        project_prefix = f"projects/{self.project_id}" if self.project_id else "jobs"
+        remote_prefix = f"{project_prefix}/interim/{self.job_id}"
+        base_dir = self.paths.interim_dir
+        normalized: list[Dict[str, Any]] = []
+        for segment in segments:
+            updated = dict(segment)
+            audio_value = updated.get("audio_file")
+            if isinstance(audio_value, str):
+                if audio_value.startswith("s3://") or audio_value.startswith(
+                    remote_prefix
+                ):
+                    normalized.append(updated)
+                    continue
+                candidate = Path(audio_value)
+                try:
+                    relative_path = candidate.relative_to(base_dir)
+                except ValueError:
+                    logger.debug(
+                        "audio_file 경로 %s 가 %s 기준 상대 경로가 아니어서 그대로 둡니다.",
+                        candidate,
+                        base_dir,
+                    )
+                else:
+                    updated["audio_file"] = (
+                        f"{remote_prefix}/{relative_path.as_posix()}"
+                    )
+            normalized.append(updated)
+        return normalized
